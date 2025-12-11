@@ -454,6 +454,192 @@ class StereoSort:
 
         return detections
 
+    def summarize_scene_stereo(
+        self,
+        left_scene_path: Path,
+        right_scene_path: Path,
+        min_area: float = 200.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Process a left/right scene pair and report stereo disparities per object.
+
+        Args:
+            left_scene_path: Path to the left camera tensor (.pt).
+            right_scene_path: Path to the right camera tensor (.pt).
+            min_area: Minimum contour area to be considered a valid object.
+
+        Returns:
+            List of dicts with color, shape, left/right centroids, and disparity
+            (x_left - x_right) in pixels.
+        """
+
+        left_scene_path = Path(left_scene_path)
+        right_scene_path = Path(right_scene_path)
+
+        if not left_scene_path.exists():
+            raise FileNotFoundError(f"Scene does not exist: {left_scene_path}")
+        if not right_scene_path.exists():
+            raise FileNotFoundError(f"Scene does not exist: {right_scene_path}")
+
+        left_img = self._load_pt_image(left_scene_path)
+        right_img = self._load_pt_image(right_scene_path)
+
+        left_hsv = cv.cvtColor(left_img, cv.COLOR_BGR2HSV)
+        right_hsv = cv.cvtColor(right_img, cv.COLOR_BGR2HSV)
+
+        left_detections, _ = self._detect_shapes(
+            left_img, left_hsv, left_scene_path.name, min_area
+        )
+        right_detections, _ = self._detect_shapes(
+            right_img, right_hsv, right_scene_path.name, min_area
+        )
+
+        if not left_detections or not right_detections:
+            print(
+                f"{left_scene_path.name}/{right_scene_path.name}: Unable to compute disparities; missing detections."
+            )
+            return []
+
+        matches: List[Dict[str, Any]] = []
+        used_right_indices = set()
+
+        for left_det in left_detections:
+            left_label = (left_det["color"], left_det["shape"])
+            left_cx, left_cy = left_det["centroid"]
+
+            best_idx = None
+            best_dist = float("inf")
+
+            for idx, right_det in enumerate(right_detections):
+                if idx in used_right_indices:
+                    continue
+                if (right_det["color"], right_det["shape"]) != left_label:
+                    continue
+
+                right_cx, right_cy = right_det["centroid"]
+                dist = np.hypot(left_cx - right_cx, left_cy - right_cy)
+
+                if dist < best_dist:
+                    best_idx = idx
+                    best_dist = dist
+
+            if best_idx is None:
+                continue
+
+            used_right_indices.add(best_idx)
+            right_det = right_detections[best_idx]
+            right_cx, right_cy = right_det["centroid"]
+            disparity = left_cx - right_cx
+
+            matches.append(
+                {
+                    "color": left_det["color"],
+                    "shape": left_det["shape"],
+                    "centroid_left": (left_cx, left_cy),
+                    "centroid_right": (right_cx, right_cy),
+                    "disparity": disparity,
+                }
+            )
+
+        if not matches:
+            print(
+                f"{left_scene_path.name}/{right_scene_path.name}: No stereo matches; color/shape labels did not align."
+            )
+            return []
+
+        print(f"Stereo scene {left_scene_path.name} vs {right_scene_path.name}:")
+        for idx, match in enumerate(matches, 1):
+            cx_l, cy_l = match["centroid_left"]
+            cx_r, cy_r = match["centroid_right"]
+            print(
+                f"  {idx}. color={match['color']} shape={match['shape']} "
+                f"left=({cx_l},{cy_l}) right=({cx_r},{cy_r}) disparity={match['disparity']} px"
+            )
+
+        return matches
+
+    @staticmethod
+    def determine_sort_rule(
+        detections: List[Dict[str, Any]]
+    ) -> Tuple[str, List[str]]:
+        """
+        Decide whether to sort by color or shape based on distinct value counts.
+
+        Returns:
+            (attribute, ordered_labels) where attribute i(x,y,z,bin), s 'color' or 'shape' and
+            ordered_labels preserves first-seen order for stable binning.
+        """
+        if not detections:
+            return None, []
+
+        colors = [det.get("color") for det in detections]
+        shapes = [det.get("shape") for det in detections]
+
+        def unique_ordered(values):
+            seen = []
+            for val in values:
+                if val not in seen:
+                    seen.append(val)
+            return seen
+
+        unique_colors = unique_ordered(colors)
+        unique_shapes = unique_ordered(shapes)
+
+        if len(unique_colors) > len(unique_shapes):
+            return "color", unique_colors
+        if len(unique_shapes) > len(unique_colors):
+            return "shape", unique_shapes
+        # Tie: default to color for determinism
+        return "color", unique_colors
+
+    def apply_sort_rule(
+        self, detections: List[Dict[str, Any]]
+    ) -> Tuple[str, List[Tuple[float, float, float, int]], List[Dict[str, Any]]]:
+        """
+        Apply the variance-based sorting rule to stereo detections.
+
+        Returns:
+            attribute used ('color' or 'shape'), a list of tuples
+            (X_world, Y_world, Z_world, bin_index), and the detections sorted
+            by the same bin order.
+        """
+        attribute, labels = self.determine_sort_rule(detections)
+        if attribute is None:
+            return None, [], []
+
+        label_to_bin = {label: idx for idx, label in enumerate(labels)}
+
+        records = []
+        for det in detections:
+            centroid = det.get("centroid_left") or det.get("centroid")
+            if centroid is None:
+                continue
+            x, y = centroid
+            disparity = det.get("disparity", 0.0)
+            bin_idx = label_to_bin.get(det.get(attribute))
+            if bin_idx is None:
+                continue
+            disparity_tensor = torch.tensor([disparity], dtype=torch.float32)
+            depth_tensor = self.disparity_to_depth(disparity_tensor, side="left")
+
+            u_tensor = torch.tensor([x], dtype=torch.float32)
+            v_tensor = torch.tensor([y], dtype=torch.float32)
+            coords_tensor = self.pixels_to_coords(
+                u_tensor, v_tensor, depth_tensor, side="left"
+            )
+
+            coords_list = coords_tensor.reshape(-1).tolist()
+            if len(coords_list) < 3:
+                continue
+
+            world_x, world_y, world_z = coords_list[:3]
+            records.append((bin_idx, (world_x, world_y, world_z, bin_idx), det))
+
+        records.sort(key=lambda item: item[0])
+        binned = [item[1] for item in records]
+        sorted_detections = [item[2] for item in records]
+        return attribute, binned, sorted_detections
+
     def classify_dataset(
         self,
         dataset_json: Path,
