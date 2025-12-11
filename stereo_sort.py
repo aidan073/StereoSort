@@ -3,13 +3,28 @@ This file holds functions that allow going from stereo images to ordered target
 positions, based on some sorting criteria.
 """
 
-import torch
-import cv2 as cv
+import json
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
 
-from typing import List, Tuple
+import cv2 as cv
+import numpy as np
+import torch
 
 
 class StereoSort:
+    _KERNEL = np.ones((5, 5), dtype=np.uint8)
+    _COLOR_THRESHOLDS = {
+        "red": [
+            (np.array([0, 180, 180]), np.array([10, 255, 255])),
+            (np.array([170, 180, 180]), np.array([179, 255, 255])),
+        ],
+        "green": [(np.array([50, 180, 180]), np.array([70, 255, 255]))],
+        "blue": [(np.array([110, 180, 180]), np.array([130, 255, 255]))],
+    }
+
     def __init__(self, data_bundle: dict = None):
         """
         data_bundle (dict): All the parameters necessary for the StereoSort methods. You can set this now,
@@ -42,6 +57,7 @@ class StereoSort:
         self.disparity_map = None
         self._L_mask = None
         self._R_mask = None
+        self._output_dir = None
 
     def load_data_bundle(self, data_bundle: dict):
         self.data_bundle = data_bundle
@@ -236,3 +252,351 @@ class StereoSort:
 
         best_disp = best_x - x
         return best_x, best_disp, best_ncc
+
+    @staticmethod
+    def _load_pt_image(path: Path) -> np.ndarray:
+        """
+        Load a tensor saved via torch.save and convert it to an OpenCV BGR image.
+        """
+        tensor = torch.load(path, map_location="cpu")
+
+        if not torch.is_tensor(tensor):
+            raise ValueError(f"{path.name} does not contain a tensor.")
+
+        if not torch.is_floating_point(tensor):
+            tensor = tensor.float()
+
+        tensor = tensor.squeeze()
+
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)  # grayscale
+        elif tensor.dim() == 3 and tensor.shape[0] not in (1, 3):
+            tensor = tensor.permute(2, 0, 1)  # channels-last -> channels-first
+
+        if tensor.size(0) == 1:
+            tensor = tensor.repeat(3, 1, 1)
+
+        if tensor.max() > 1:
+            tensor = tensor / 255.0
+
+        tensor = tensor.clamp(0, 1)
+        tensor = (tensor * 255).byte().cpu().numpy()
+        rgb = np.transpose(tensor, (1, 2, 0))
+        return cv.cvtColor(rgb, cv.COLOR_RGB2BGR)
+
+    @staticmethod
+    def _classify_shape(contour: np.ndarray, min_area: float = 200.0) -> str:
+        area = cv.contourArea(contour)
+        if area < min_area:
+            return None
+        peri = cv.arcLength(contour, True)
+        approx = cv.approxPolyDP(contour, 0.02 * peri, True)
+        vertices = len(approx)
+        circularity = (4 * np.pi * area) / (peri * peri + 1e-5)
+
+        if vertices == 4:
+            return "cube"
+        if circularity > 0.7:
+            return "cylinder"
+        if vertices == 3:
+            return "triangular_prism"
+        return "unknown"
+
+    @staticmethod
+    def _classify_color_at_pixel(
+        hsv_img: np.ndarray, cx: int, cy: int
+    ) -> Tuple[str, Tuple[int, int, int]]:
+        hue, sat, val = hsv_img[cy, cx]
+        if (hue <= 10 or hue >= 170) and sat > 150 and val > 150:
+            return "red", (255, 255, 255)
+        if 50 <= hue <= 70 and sat > 150 and val > 150:
+            return "green", (255, 0, 255)
+        if 110 <= hue <= 130 and sat > 150 and val > 150:
+            return "blue", (0, 255, 255)
+        return "unknown", (200, 200, 200)
+
+    @classmethod
+    def _create_color_mask(cls, hsv_img: np.ndarray) -> np.ndarray:
+        mask = np.zeros(hsv_img.shape[:2], dtype=np.uint8)
+
+        for color_ranges in cls._COLOR_THRESHOLDS.values():
+            color_mask = np.zeros_like(mask)
+            for lower, upper in color_ranges:
+                color_mask = cv.bitwise_or(color_mask, cv.inRange(hsv_img, lower, upper))
+            mask = cv.bitwise_or(mask, color_mask)
+
+        return mask
+
+    def _detect_shapes(
+        self,
+        img: np.ndarray,
+        hsv: np.ndarray,
+        file_name: str,
+        min_area: float,
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+        """
+        Run the contour-based detection on a single image.
+        Returns both the detections and the annotated visualization.
+        """
+        mask = self._create_color_mask(hsv)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, self._KERNEL)
+        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+        out = img.copy()
+        detections: List[Dict[str, Any]] = []
+
+        for contour in contours:
+            shape = self._classify_shape(contour, min_area)
+            if not shape:
+                continue
+
+            M = cv.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+
+            color_name, draw_color = self._classify_color_at_pixel(hsv, cx, cy)
+            label = f"{color_name} {shape}"
+
+            cv.drawContours(out, [contour], -1, draw_color, 2)
+            cv.circle(out, (cx, cy), 4, draw_color, -1)
+            cv.putText(
+                out,
+                label,
+                (cx - 60, cy - 10),
+                cv.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                draw_color,
+                2,
+                cv.LINE_AA,
+            )
+
+            pixel_hsv = hsv[cy, cx].tolist()
+            detections.append(
+                {
+                    "file": file_name,
+                    "label": label,
+                    "shape": shape,
+                    "color": color_name,
+                    "centroid": (cx, cy),
+                    "hsv": pixel_hsv,
+                }
+            )
+
+        return detections, out
+
+    def classify_shapes_in_directory(
+        self,
+        input_dir: Path,
+        output_dir: Path = None,
+        min_area: float = 200.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Replicates the contouring pipeline over a directory of .pt images.
+        Returns the list of detected labels per file, and saves annotated images.
+        """
+        input_path = Path(input_dir)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input directory does not exist: {input_path}")
+
+        output_path = Path(output_dir) if output_dir else input_path / "abscolor_classified"
+        output_path.mkdir(parents=True, exist_ok=True)
+        self._output_dir = output_path
+
+        results: List[Dict[str, Any]] = []
+
+        for file in sorted(input_path.glob("*.pt")):
+            img = self._load_pt_image(file)
+            hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+
+            detections, annotated = self._detect_shapes(img, hsv, file.name, min_area)
+            for detection in detections:
+                cx, cy = detection["centroid"]
+                print(
+                    f"{file.name}: {detection['label']} centroid=({cx},{cy}) HSV={detection['hsv']}"
+                )
+            results.extend(detections)
+
+            cv.imwrite(str(output_path / f"{file.stem}.jpg"), annotated)
+
+        print(f"\nColor + shape labeling (high contrast) saved to: {output_path}")
+        return results
+
+    def summarize_scene(
+        self,
+        scene_path: Path,
+        min_area: float = 200.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Pipeline helper for a single scene (.pt tensor).
+        Prints detections in a readable format and returns them for further use.
+        """
+        scene_path = Path(scene_path)
+        if not scene_path.exists():
+            raise FileNotFoundError(f"Scene does not exist: {scene_path}")
+
+        img = self._load_pt_image(scene_path)
+        hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+        detections, _ = self._detect_shapes(img, hsv, scene_path.name, min_area)
+
+        if not detections:
+            print(f"{scene_path.name}: No objects detected.")
+            return []
+
+        print(f"{scene_path.name} detections:")
+        for idx, detection in enumerate(detections, 1):
+            cx, cy = detection["centroid"]
+            hsv_values = detection["hsv"]
+            print(
+                f"  {idx}. color={detection['color']}, shape={detection['shape']}, centroid=({cx},{cy}), HSV={hsv_values}"
+            )
+
+        return detections
+
+    def classify_dataset(
+        self,
+        dataset_json: Path,
+        output_json: Path = None,
+        min_area: float = 200.0,
+    ) -> Path:
+        """
+        Run contour-based classification over every sample in dataset_json.
+        Outputs a JSON file with detections for downstream accuracy evaluation.
+        """
+        dataset_path = Path(dataset_json)
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"dataset.json not found: {dataset_path}")
+
+        with dataset_path.open("r", encoding="utf-8") as f:
+            dataset = json.load(f)
+
+        samples = dataset.get("samples", [])
+        dataset_root = dataset_path.parent
+
+        predictions: Dict[str, Any] = {
+            "source_dataset": str(dataset_path),
+            "created": datetime.utcnow().isoformat(),
+            "min_area": min_area,
+            "num_samples": len(samples),
+            "samples": [],
+        }
+
+        for sample in samples:
+            sample_id = sample.get("sample_id")
+            left_rel = sample.get("left_tensor_path")
+            if not left_rel:
+                continue
+
+            left_path = dataset_root / left_rel
+            if not left_path.exists():
+                print(f"[WARN] Left tensor missing for sample {sample_id}: {left_path}")
+                continue
+
+            img = self._load_pt_image(left_path)
+            hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+            detections, _ = self._detect_shapes(img, hsv, left_path.name, min_area)
+
+            predictions["samples"].append(
+                {
+                    "sample_id": sample_id,
+                    "left_tensor_path": str(left_rel),
+                    "detections": detections,
+                }
+            )
+
+        output_path = (
+            Path(output_json)
+            if output_json
+            else dataset_path.with_name(f"{dataset_path.stem}_predictions.json")
+        )
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(predictions, f, indent=2)
+
+        print(f"Predictions saved to: {output_path}")
+        return output_path
+
+    def compare_predictions(
+        self,
+        dataset_json: Path,
+        predictions_json: Path,
+    ) -> Dict[str, Any]:
+        """
+        Compare saved predictions against dataset ground truth.
+        Returns accuracy metrics (color+shape pairs) and prints a brief summary.
+        """
+        dataset_path = Path(dataset_json)
+        predictions_path = Path(predictions_json)
+
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"dataset.json not found: {dataset_path}")
+        if not predictions_path.exists():
+            raise FileNotFoundError(f"predictions json not found: {predictions_path}")
+
+        with dataset_path.open("r", encoding="utf-8") as f:
+            dataset = json.load(f)
+        with predictions_path.open("r", encoding="utf-8") as f:
+            predictions = json.load(f)
+
+        dataset_samples = {s["sample_id"]: s for s in dataset.get("samples", [])}
+        prediction_samples = {
+            s["sample_id"]: s for s in predictions.get("samples", [])
+        }
+
+        total_gt = 0
+        total_pred = 0
+        total_correct = 0
+        per_sample_metrics = []
+
+        for sample_id, sample in dataset_samples.items():
+            gt_counter = Counter()
+            for pickable in sample.get("pickables", []):
+                key = (pickable.get("color_name"), pickable.get("shape"))
+                gt_counter[key] += 1
+
+            pred_counter = Counter()
+            detection_sample = prediction_samples.get(sample_id, {})
+            for detection in detection_sample.get("detections", []):
+                key = (detection.get("color"), detection.get("shape"))
+                pred_counter[key] += 1
+
+            sample_correct = sum(
+                min(gt_counter[key], pred_counter.get(key, 0)) for key in gt_counter
+            )
+            sample_gt_total = sum(gt_counter.values())
+            sample_pred_total = sum(pred_counter.values())
+
+            total_gt += sample_gt_total
+            total_pred += sample_pred_total
+            total_correct += sample_correct
+
+            per_sample_metrics.append(
+                {
+                    "sample_id": sample_id,
+                    "ground_truth": sample_gt_total,
+                    "predicted": sample_pred_total,
+                    "correct": sample_correct,
+                    "accuracy": sample_correct / sample_gt_total
+                    if sample_gt_total
+                    else 0.0,
+                }
+            )
+
+        overall_accuracy = total_correct / total_gt if total_gt else 0.0
+        metrics = {
+            "dataset": str(dataset_path),
+            "predictions": str(predictions_path),
+            "total_ground_truth": total_gt,
+            "total_predictions": total_pred,
+            "total_correct": total_correct,
+            "overall_accuracy": overall_accuracy,
+            "per_sample": per_sample_metrics,
+        }
+
+        print("=== Accuracy Summary ===")
+        print(f"Ground truth objects: {total_gt}")
+        print(f"Predicted objects:    {total_pred}")
+        print(f"Correct matches:      {total_correct}")
+        print(f"Accuracy:             {overall_accuracy:.2%}")
+
+        return metrics
