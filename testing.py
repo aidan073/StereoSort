@@ -21,7 +21,7 @@ Only one of (--scene, --dir, --dataset, --compare) should be active at a time.
 import argparse
 from pathlib import Path
 
-from StereoSort.stereo_sort import StereoSort
+from stereo_sort import StereoSort
 
 
 def main():
